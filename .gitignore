@@ -1,0 +1,31 @@
+# Data directories
+test_T_shift_genes/
+T_shift_3_genes/
+segmentation_output/
+analysis_results/
+analysis_2ch/
+cloning_wt/
+CellASIC_*/
+CellAsic_*/
+Tshift_*/
+
+# Python
+__pycache__/
+*.pyc
+
+# Output files
+*.tif
+*.tiff
+*.nd2
+
+# OS
+.DS_Store
+
+# Old/checkpoint scripts (tracked separately if needed)
+segment_nd2.py
+segment_nd2_v3.py
+segment_and_quantify.py
+segment_zstack.py
+segment_cloning_omni.py
+segment_cloning_checkpoint.py
+collect_results_2chan.py
