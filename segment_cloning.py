@@ -2157,8 +2157,19 @@ def process_cloning_image(input_file, output_dir, params=CELLPOSE_PARAMS, force_
             ch_slice = data[z, MCHERRY_CHANNEL, :, :]
             z_max_mcherry.append(float(ch_slice[mask_bool].max()) if np.any(mask_bool) else 0.0)
         best_z_refocus = int(np.argmax(z_max_mcherry))
+        z_jump = abs(best_z_refocus - best_z)
         print(f"  Z-scores (max mCherry in masks): {['%.0f' % s for s in z_max_mcherry]}")
-        print(f"  mCherry refocus z: {best_z_refocus} (was {best_z})")
+        print(f"  mCherry refocus z: {best_z_refocus} (was {best_z}, jump={z_jump})")
+
+        # If refocus moved by >1 slice and initial segmentation found <6 cells,
+        # re-segment at the new z to get a better mask
+        if z_jump >= 2 and n_cells < 6:
+            print(f"  Large z-jump ({z_jump}) with few cells ({n_cells}) — re-segmenting at z={best_z_refocus}...")
+            reseg_image = data[best_z_refocus, MCHERRY_CHANNEL, :, :]
+            masks = segment_frame(model, reseg_image, params)
+            n_cells = len(np.unique(masks)) - 1
+            print(f"  Re-segmentation detected {n_cells} cells")
+
         best_z = best_z_refocus
         focus_results['z_mcherry_measure'] = best_z
         focus_results['z_mcherry_refocus_scores'] = z_max_mcherry
