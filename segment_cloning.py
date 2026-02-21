@@ -2148,6 +2148,33 @@ def process_cloning_image(input_file, output_dir, params=CELLPOSE_PARAMS, force_
     n_cells = len(np.unique(masks)) - 1  # Exclude background
     print(f"  Detected {n_cells} cells")
 
+    # mCherry intensity refocus: scan all z-slices for brightest mCherry within masks
+    if n_cells > 0:
+        print(f"\nmCherry intensity refocus: scanning z-slices for brightest mCherry in masks...")
+        mask_bool = masks > 0
+        z_max_mcherry = []
+        for z in range(n_z):
+            ch_slice = data[z, MCHERRY_CHANNEL, :, :]
+            z_max_mcherry.append(float(ch_slice[mask_bool].max()) if np.any(mask_bool) else 0.0)
+        best_z_refocus = int(np.argmax(z_max_mcherry))
+        print(f"  Z-scores (max mCherry in masks): {['%.0f' % s for s in z_max_mcherry]}")
+        print(f"  mCherry refocus z: {best_z_refocus} (was {best_z})")
+        best_z = best_z_refocus
+        focus_results['z_mcherry_measure'] = best_z
+        focus_results['z_mcherry_refocus_scores'] = z_max_mcherry
+
+        # Recompute GFP z from updated mCherry z
+        if z_shift is not None:
+            best_z_gfp_measure = max(0, min(n_z - 1, best_z + z_shift))
+            print(f"  GFP z updated: {best_z_gfp_measure} (mCherry z + {z_shift})")
+        focus_results['z_gfp_measure'] = best_z_gfp_measure
+        focus_results['z_segmentation'] = best_z
+
+        # Re-extract images at updated z positions
+        mcherry_image = data[best_z, MCHERRY_CHANNEL, :, :]
+        gfp_image = data[best_z_gfp_measure, GFP_CHANNEL, :, :]
+        ph3_image = data[best_z_gfp_measure, PH3_CHANNEL, :, :]
+
     # Calculate background for each fluorescent channel (2D quadratic model)
     print("\nCalculating background...")
     gfp_bkg_stats = calculate_background(gfp_image, masks, iqr_factor=1.5)
