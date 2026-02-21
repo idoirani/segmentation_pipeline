@@ -26,6 +26,7 @@ import matplotlib.pyplot as plt
 from scipy import ndimage
 import cv2
 import argparse
+from autofocus import select_best_z_fluorescence
 
 
 # =============================================================================
@@ -39,11 +40,11 @@ MCHERRY_CHANNEL = 2
 
 # Omnipose parameters - using Ph3 (phase contrast) for segmentation
 CELLPOSE_PARAMS = {
-    'model_type': 'bact_phase_omni',  # Omnipose bacterial phase model
-    'diameter': 30,                    # increased from 15
+    'model_type': 'bact_fluor_omni',  # Omnipose bacterial phase model
+    'diameter': 15,                    # increased from 15
     'channels': [0, 0],  # grayscale
-    'flow_threshold': 0.4,             # increased from 0.0 - stricter flow consistency
-    'mask_threshold': -2,               # increased from -2 - more conservative
+    'flow_threshold': 0.4,             # 
+    'mask_threshold': -2,               # 
     'min_size': 200,                    # filter out small fragments
     'omni': True,
     'cluster': True,  # Use DBSCAN clustering
@@ -737,6 +738,114 @@ def calculate_background_stats(image, masks, iqr_factor=1.5):
     }
 
 
+def _robust_median_in_region(image, masks, y_start, y_end, x_start, x_end, iqr_factor=1.5):
+    """Compute robust median of background pixels in a rectangular region."""
+    region_img = image[y_start:y_end, x_start:x_end]
+    region_masks = masks[y_start:y_end, x_start:x_end]
+    bg_pixels = region_img[region_masks == 0].astype(np.float64)
+    if len(bg_pixels) == 0:
+        return np.nan
+    q1 = np.percentile(bg_pixels, 25)
+    q3 = np.percentile(bg_pixels, 75)
+    iqr = q3 - q1
+    inliers = bg_pixels[(bg_pixels >= q1 - iqr_factor * iqr) &
+                         (bg_pixels <= q3 + iqr_factor * iqr)]
+    if len(inliers) == 0:
+        return np.median(bg_pixels)
+    return np.median(inliers)
+
+
+def calculate_background(image, masks, iqr_factor=1.5):
+    """
+    Calculate a 2D quadratic background model from a 4x4 grid of regions.
+
+    1. Divide image into 4x4 regions (16 tiles)
+    2. For each region: take pixels outside masks, IQR outlier removal, median
+    3. Fit a 2D quadratic surface bkg(y, x) = a*x^2 + b*y^2 + c*x*y + d*x + e*y + f
+    4. Generate full-resolution 2D background image
+
+    Returns:
+        dict with 'bkg_image' (2D array), 'median' (scalar, center value),
+        'mean', 'std', 'n_outliers', 'quadrant_values', 'fit_coeffs'
+    """
+    h, w = image.shape
+    n_grid = 4
+
+    y_edges = np.linspace(0, h, n_grid + 1, dtype=int)
+    x_edges = np.linspace(0, w, n_grid + 1, dtype=int)
+
+    quad_centers_y = []
+    quad_centers_x = []
+    quad_values = []
+
+    for iy in range(n_grid):
+        for ix in range(n_grid):
+            y0, y1 = y_edges[iy], y_edges[iy + 1]
+            x0, x1 = x_edges[ix], x_edges[ix + 1]
+            cy = (y0 + y1) / 2.0
+            cx = (x0 + x1) / 2.0
+            med = _robust_median_in_region(image, masks, y0, y1, x0, x1, iqr_factor)
+            quad_centers_y.append(cy)
+            quad_centers_x.append(cx)
+            quad_values.append(med)
+
+    quad_centers_y = np.array(quad_centers_y)
+    quad_centers_x = np.array(quad_centers_x)
+    quad_values = np.array(quad_values)
+
+    valid = ~np.isnan(quad_values)
+    if valid.sum() < 6:
+        # Not enough points for quadratic fit; fall back to global median
+        bg_pixels = image[masks == 0].astype(np.float64)
+        q1, q3 = np.percentile(bg_pixels, 25), np.percentile(bg_pixels, 75)
+        iqr = q3 - q1
+        inliers = bg_pixels[(bg_pixels >= q1 - iqr_factor * iqr) &
+                             (bg_pixels <= q3 + iqr_factor * iqr)]
+        med = np.median(inliers) if len(inliers) > 0 else np.median(bg_pixels)
+        bkg_image = np.full_like(image, med, dtype=np.float64)
+        return {
+            'bkg_image': bkg_image,
+            'median': med,
+            'mean': med,
+            'std': 0.0,
+            'n_outliers': 0,
+            'quadrant_values': quad_values.tolist(),
+            'fit_coeffs': (0.0, 0.0, 0.0, 0.0, 0.0, med),
+        }
+
+    xv = quad_centers_x[valid]
+    yv = quad_centers_y[valid]
+    A = np.column_stack([xv**2, yv**2, xv * yv, xv, yv, np.ones(valid.sum())])
+    coeffs, _, _, _ = np.linalg.lstsq(A, quad_values[valid], rcond=None)
+
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float64)
+    bkg_image = (coeffs[0] * xx**2 + coeffs[1] * yy**2 + coeffs[2] * xx * yy +
+                 coeffs[3] * xx + coeffs[4] * yy + coeffs[5])
+
+    fitted_at_centers = (coeffs[0] * xv**2 + coeffs[1] * yv**2 + coeffs[2] * xv * yv +
+                         coeffs[3] * xv + coeffs[4] * yv + coeffs[5])
+    residuals = quad_values[valid] - fitted_at_centers
+    cx, cy = w / 2.0, h / 2.0
+    center_value = float(coeffs[0] * cx**2 + coeffs[1] * cy**2 + coeffs[2] * cx * cy +
+                         coeffs[3] * cx + coeffs[4] * cy + coeffs[5])
+
+    bg_pixels = image[masks == 0].astype(np.float64)
+    q1, q3 = np.percentile(bg_pixels, 25), np.percentile(bg_pixels, 75)
+    iqr = q3 - q1
+    n_outliers = int(np.sum((bg_pixels < q1 - iqr_factor * iqr) |
+                            (bg_pixels > q3 + iqr_factor * iqr)))
+
+    return {
+        'bkg_image': bkg_image,
+        'median': center_value,
+        'mean': float(np.mean(bkg_image)),
+        'std': float(np.std(residuals)),
+        'n_outliers': n_outliers,
+        'quadrant_values': quad_values.tolist(),
+        'fit_coeffs': tuple(float(c) for c in coeffs),
+    }
+
+
 def find_optimal_channel_shift(masks, target_image, shift_range=5):
     """
     Find the optimal global XY shift to maximize intensity within masks.
@@ -907,22 +1016,41 @@ def load_nd2_zstack(filepath, time_index=None):
 
 def segment_frame(model, image, params):
     """Segment a single frame using Omnipose."""
-    masks, flows, styles = model.eval(
-        image,
-        diameter=params['diameter'],
-        channels=params['channels'],
-        flow_threshold=params.get('flow_threshold', 0.4),
-        mask_threshold=params.get('mask_threshold', 0),
-        min_size=params.get('min_size', 80),
-        omni=params.get('omni', True),
-        cluster=params.get('cluster', True),
-    )
+    cluster = params.get('cluster', True)
+    try:
+        masks, flows, styles = model.eval(
+            image,
+            diameter=params['diameter'],
+            channels=params['channels'],
+            flow_threshold=params.get('flow_threshold', 0.4),
+            mask_threshold=params.get('mask_threshold', 0),
+            min_size=params.get('min_size', 80),
+            omni=params.get('omni', True),
+            cluster=cluster,
+        )
+    except (ValueError, RuntimeError, IndexError) as e:
+        if cluster:
+            print(f"  Warning: clustering failed ({type(e).__name__}), retrying with fresh model...")
+            fresh_model = omni_models.CellposeModel(model_type=params['model_type'], gpu=False)
+            masks, flows, styles = fresh_model.eval(
+                image,
+                diameter=params['diameter'],
+                channels=params['channels'],
+                flow_threshold=params.get('flow_threshold', 0.4),
+                mask_threshold=params.get('mask_threshold', 0),
+                min_size=params.get('min_size', 80),
+                omni=params.get('omni', True),
+                cluster=False,
+            )
+        else:
+            raise
     return masks
 
 
 def measure_cells(masks, gfp_image, mcherry_image, gfp_bkg_stats=None, mcherry_bkg_stats=None,
                    gfp_shifted_masks=None, mcherry_shifted_masks=None, saturation_value=65535,
-                   gfp_exposure_ms=None, mcherry_exposure_ms=None):
+                   gfp_exposure_ms=None, mcherry_exposure_ms=None,
+                   gfp_bkg_image=None, mcherry_bkg_image=None):
     """
     Measure properties of each cell with background subtraction and exposure normalization.
 
@@ -930,13 +1058,15 @@ def measure_cells(masks, gfp_image, mcherry_image, gfp_bkg_stats=None, mcherry_b
         masks: Segmentation masks
         gfp_image: GFP fluorescence image
         mcherry_image: mCherry fluorescence image
-        gfp_bkg_stats: Background statistics for GFP (from calculate_background_stats)
-        mcherry_bkg_stats: Background statistics for mCherry
+        gfp_bkg_stats: Background statistics for GFP (legacy, used if gfp_bkg_image is None)
+        mcherry_bkg_stats: Background statistics for mCherry (legacy, used if mcherry_bkg_image is None)
         gfp_shifted_masks: Shifted masks for GFP measurement (optional)
         mcherry_shifted_masks: Shifted masks for mCherry measurement (optional)
         saturation_value: Pixel value indicating saturation (default: 65535 for 16-bit)
         gfp_exposure_ms: GFP exposure time in ms (for rate calculation)
         mcherry_exposure_ms: mCherry exposure time in ms (for rate calculation)
+        gfp_bkg_image: 2D background image for GFP (from calculate_background)
+        mcherry_bkg_image: 2D background image for mCherry (from calculate_background)
 
     Returns a DataFrame with per-cell measurements including rates (intensity/exposure).
     """
@@ -991,7 +1121,11 @@ def measure_cells(masks, gfp_image, mcherry_image, gfp_bkg_stats=None, mcherry_b
             mcherry_area = 0
 
         # Background subtraction for GFP
-        if gfp_bkg_stats is not None and gfp_area > 0:
+        if gfp_bkg_image is not None and gfp_area > 0:
+            gfp_bkg_estimate = np.sum(gfp_bkg_image[gfp_cell_mask])
+            gfp_bkg_error = 0
+            gfp_sum_bkg_sub = gfp_sum - gfp_bkg_estimate
+        elif gfp_bkg_stats is not None and gfp_area > 0:
             gfp_bkg_estimate = gfp_bkg_stats['mean'] * gfp_area
             gfp_bkg_error = gfp_bkg_stats['std'] / np.sqrt(gfp_area)
             gfp_sum_bkg_sub = gfp_sum - gfp_bkg_estimate
@@ -1001,7 +1135,11 @@ def measure_cells(masks, gfp_image, mcherry_image, gfp_bkg_stats=None, mcherry_b
             gfp_sum_bkg_sub = gfp_sum
 
         # Background subtraction for mCherry
-        if mcherry_bkg_stats is not None and mcherry_area > 0:
+        if mcherry_bkg_image is not None and mcherry_area > 0:
+            mcherry_bkg_estimate = np.sum(mcherry_bkg_image[mcherry_cell_mask])
+            mcherry_bkg_error = 0
+            mcherry_sum_bkg_sub = mcherry_sum - mcherry_bkg_estimate
+        elif mcherry_bkg_stats is not None and mcherry_area > 0:
             mcherry_bkg_estimate = mcherry_bkg_stats['mean'] * mcherry_area
             mcherry_bkg_error = mcherry_bkg_stats['std'] / np.sqrt(mcherry_area)
             mcherry_sum_bkg_sub = mcherry_sum - mcherry_bkg_estimate
@@ -1110,6 +1248,43 @@ def compute_summary_stats(cell_df):
 # Visualization Functions
 # =============================================================================
 
+def save_background_visualization(gfp_image, mcherry_image, gfp_bkg_stats, mcherry_bkg_stats, output_path):
+    """Save visualization of background model and background-subtracted images."""
+    gfp_bkg_image = gfp_bkg_stats['bkg_image']
+    mcherry_bkg_image = mcherry_bkg_stats['bkg_image']
+
+    gfp_bkg_sub = np.clip(gfp_image.astype(np.float64) - gfp_bkg_image, 0, None)
+    mcherry_bkg_sub = np.clip(mcherry_image.astype(np.float64) - mcherry_bkg_image, 0, None)
+
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+
+    for row, (raw, bkg, sub, name, center) in enumerate([
+        (gfp_image, gfp_bkg_image, gfp_bkg_sub, 'GFP', gfp_bkg_stats['median']),
+        (mcherry_image, mcherry_bkg_image, mcherry_bkg_sub, 'mCherry', mcherry_bkg_stats['median']),
+    ]):
+        vmin_raw = np.percentile(raw, 1)
+        vmax_raw = np.percentile(raw, 99)
+        cmap = 'Greens' if name == 'GFP' else 'Reds'
+
+        axes[row, 0].imshow(raw, cmap=cmap, vmin=vmin_raw, vmax=vmax_raw)
+        axes[row, 0].set_title(f'{name} raw')
+        axes[row, 0].axis('off')
+
+        im = axes[row, 1].imshow(bkg, cmap='hot')
+        axes[row, 1].set_title(f'{name} background (center={center:.0f})')
+        axes[row, 1].axis('off')
+        plt.colorbar(im, ax=axes[row, 1], fraction=0.046, pad=0.04)
+
+        vmax_sub = np.percentile(sub, 99)
+        axes[row, 2].imshow(sub, cmap=cmap, vmin=0, vmax=vmax_sub)
+        axes[row, 2].set_title(f'{name} background-subtracted')
+        axes[row, 2].axis('off')
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=VIS_DPI)
+    plt.close(fig)
+
+
 def save_segmentation_visualization(ph3_image, gfp_image, mcherry_image, masks,
                                      n_cells, best_z, focus_results, output_path):
     """Save visualization showing segmentation results."""
@@ -1140,7 +1315,8 @@ def save_segmentation_visualization(ph3_image, gfp_image, mcherry_image, masks,
     axes[0, 0].imshow(ph3_image, cmap='gray',
                       vmin=np.percentile(ph3_image, 1),
                       vmax=np.percentile(ph3_image, 99))
-    axes[0, 0].set_title(f'Phase Contrast (z={best_z})')
+    ph3_z = focus_results.get('z_gfp_measure', best_z)
+    axes[0, 0].set_title(f'Phase Contrast (z={ph3_z})')
     axes[0, 0].axis('off')
 
     # GFP
@@ -1201,6 +1377,18 @@ def save_segmentation_visualization(ph3_image, gfp_image, mcherry_image, masks,
         ax.set_xlabel('Z-slice')
         ax.set_ylabel('Normalized Gradient Score')
         ax.set_title('Focus Selection (high-pass gradient)')
+        ax.legend(fontsize=8)
+        ax.set_ylim(-0.1, 1.1)
+
+    elif isinstance(focus_results, dict) and focus_results.get('method') == 'fluorescence':
+        mcherry_scores = focus_results['mcherry']['scores']
+        z_indices = range(len(mcherry_scores))
+        mcherry_norm = np.array(mcherry_scores) / max(mcherry_scores) if max(mcherry_scores) > 0 else mcherry_scores
+        ax.plot(z_indices, mcherry_norm, 'r-o', label=f'mCherry (z={best_z})', markersize=4)
+        ax.axvline(best_z, color='black', linestyle='--', linewidth=2, label=f'Selected z={best_z}')
+        ax.set_xlabel('Z-slice')
+        ax.set_ylabel('Normalized Brenner Score')
+        ax.set_title('Focus Selection (bkg-sub Brenner, mCherry)')
         ax.legend(fontsize=8)
         ax.set_ylim(-0.1, 1.1)
 
@@ -1812,7 +2000,7 @@ Cell Area (pixels):
 # Main Processing
 # =============================================================================
 
-def process_cloning_image(input_file, output_dir, params=CELLPOSE_PARAMS, force_z=None, time_index=None, highpass_cutoff=12.0, focus_method='highpass', z_shift=None, shift_range=5):
+def process_cloning_image(input_file, output_dir, params=CELLPOSE_PARAMS, force_z=None, time_index=None, highpass_cutoff=12.0, focus_method='fluorescence', z_shift=2, shift_range=5, no_shift=False):
     """
     Process a single z-stack cloning image.
 
@@ -1891,14 +2079,26 @@ def process_cloning_image(input_file, output_dir, params=CELLPOSE_PARAMS, force_
         print(f"  Ph3 best z:     {focus_results['ph3']['best_z']}")
         print(f"  mCherry best z: {best_z}")
         print(f"  Selected z:     {best_z}")
-    else:
-        # Default: highpass gradient
+    elif focus_method == 'highpass':
         best_z, focus_results = select_best_z_dual_highpass_gradient(
             data, PH3_CHANNEL, MCHERRY_CHANNEL, highpass_sigma=highpass_sigma)
         print(f"\nFocus selection (high-pass gradient, cutoff={highpass_cutoff}px):")
         print(f"  Ph3 best z:     {focus_results['ph3']['best_z']}")
         print(f"  mCherry best z: {focus_results['mcherry']['best_z']}")
         print(f"  Median z:       {best_z}")
+    else:
+        # Default: background-subtracted Brenner on mCherry (same as segment_2channel.py)
+        best_z, scores = select_best_z_fluorescence(
+            data, MCHERRY_CHANNEL,
+            background_percentile=25, metric='brenner')
+        focus_results = {
+            'method': 'fluorescence',
+            'mcherry': {'best_z': best_z, 'scores': scores},
+            'combined_z': best_z,
+        }
+        print(f"\nFocus selection (background-subtracted Brenner on mCherry):")
+        print(f"  Z-scores: {['%.1f' % s for s in scores]}")
+        print(f"  mCherry best z: {best_z}")
 
     # Determine z for each channel
     # Segmentation uses mCherry best z (best_z)
@@ -1922,12 +2122,10 @@ def process_cloning_image(input_file, output_dir, params=CELLPOSE_PARAMS, force_
     focus_results['z_mcherry_measure'] = best_z
     focus_results['z_segmentation'] = best_z
 
-    # Get images for segmentation (at mCherry best z)
-    ph3_image = data[best_z, PH3_CHANNEL, :, :]
+    # Get images: mCherry at segmentation z, GFP and Ph3 at shifted z
     mcherry_image = data[best_z, MCHERRY_CHANNEL, :, :]
-
-    # Get GFP image at its own best z for measurement
     gfp_image = data[best_z_gfp_measure, GFP_CHANNEL, :, :]
+    ph3_image = data[best_z_gfp_measure, PH3_CHANNEL, :, :]
 
     # Initialize model and segment
     print(f"\nInitializing Omnipose model...")
@@ -1950,24 +2148,23 @@ def process_cloning_image(input_file, output_dir, params=CELLPOSE_PARAMS, force_
     n_cells = len(np.unique(masks)) - 1  # Exclude background
     print(f"  Detected {n_cells} cells")
 
-    # Calculate background statistics for each fluorescent channel
-    print("\nCalculating background statistics...")
-    gfp_bkg_stats = calculate_background_stats(gfp_image, masks, iqr_factor=1.5)
-    mcherry_bkg_stats = calculate_background_stats(mcherry_image, masks, iqr_factor=1.5)
-    print(f"  GFP background: mean={gfp_bkg_stats['mean']:.1f}, std={gfp_bkg_stats['std']:.1f}")
-    print(f"  mCherry background: mean={mcherry_bkg_stats['mean']:.1f}, std={mcherry_bkg_stats['std']:.1f}")
+    # Calculate background for each fluorescent channel (2D quadratic model)
+    print("\nCalculating background...")
+    gfp_bkg_stats = calculate_background(gfp_image, masks, iqr_factor=1.5)
+    mcherry_bkg_stats = calculate_background(mcherry_image, masks, iqr_factor=1.5)
+    print(f"  GFP background: center={gfp_bkg_stats['median']:.1f}, std={gfp_bkg_stats['std']:.1f}")
+    print(f"  mCherry background: center={mcherry_bkg_stats['median']:.1f}, std={mcherry_bkg_stats['std']:.1f}")
 
     # Find optimal channel shift
-    # Only optimize shift for channels where segmentation didn't occur
-    print(f"\nOptimizing channel alignment (range: ±{shift_range} pixels)...")
-
     # Initialize default (no shift)
     gfp_shift_result = {'optimal_shift_x': 0, 'optimal_shift_y': 0, 'percent_increase': 0, 'all_shifts': []}
     mcherry_shift_result = {'optimal_shift_x': 0, 'optimal_shift_y': 0, 'percent_increase': 0, 'all_shifts': []}
     gfp_shifted_masks = masks
     mcherry_shifted_masks = masks
 
-    if segment_channel == 'ph3':
+    if no_shift:
+        print(f"\nChannel alignment: skipped (--no-shift)")
+    elif segment_channel == 'ph3':
         # Segmented on Ph3, optimize shift for both GFP and mCherry
         gfp_shift_result = find_optimal_channel_shift(masks, gfp_image, shift_range=shift_range)
         mcherry_shift_result = find_optimal_channel_shift(masks, mcherry_image, shift_range=shift_range)
@@ -2019,12 +2216,12 @@ def process_cloning_image(input_file, output_dir, params=CELLPOSE_PARAMS, force_
     # Measure cells with background subtraction, shifted masks, and exposure normalization
     print("\nMeasuring cell intensities (with background subtraction and rate calculation)...")
     cell_df = measure_cells(masks, gfp_image, mcherry_image,
-                            gfp_bkg_stats=gfp_bkg_stats,
-                            mcherry_bkg_stats=mcherry_bkg_stats,
                             gfp_shifted_masks=gfp_shifted_masks,
                             mcherry_shifted_masks=mcherry_shifted_masks,
                             gfp_exposure_ms=gfp_exposure_ms,
-                            mcherry_exposure_ms=mcherry_exposure_ms)
+                            mcherry_exposure_ms=mcherry_exposure_ms,
+                            gfp_bkg_image=gfp_bkg_stats['bkg_image'],
+                            mcherry_bkg_image=mcherry_bkg_stats['bkg_image'])
 
     # Report saturation warnings
     if len(cell_df) > 0:
@@ -2057,7 +2254,14 @@ def process_cloning_image(input_file, output_dir, params=CELLPOSE_PARAMS, force_
     print(f"  Summary stats: {summary_path}")
 
     # Z-selection data
-    if isinstance(focus_results, dict) and 'ph3' in focus_results and 'mcherry' in focus_results:
+    if isinstance(focus_results, dict) and focus_results.get('method') == 'fluorescence':
+        mcherry_scores = focus_results['mcherry']['scores']
+        z_df = pd.DataFrame({
+            'z': range(len(mcherry_scores)),
+            'mcherry_brenner_score': mcherry_scores,
+            'selected': [z == best_z for z in range(len(mcherry_scores))]
+        })
+    elif isinstance(focus_results, dict) and 'ph3' in focus_results and 'mcherry' in focus_results:
         # Dual channel high-pass gradient method
         ph3_scores = focus_results['ph3']['scores']
         mcherry_scores = focus_results['mcherry']['scores']
@@ -2156,16 +2360,21 @@ def process_cloning_image(input_file, output_dir, params=CELLPOSE_PARAMS, force_
                                    output_dir / 'saturation_map.png')
     print(f"  Saturation map: saturation_map.png")
 
+    # Background subtracted visualization
+    save_background_visualization(gfp_image, mcherry_image, gfp_bkg_stats, mcherry_bkg_stats,
+                                   output_dir / 'background_subtracted.png')
+    print(f"  Background subtracted: background_subtracted.png")
+
     # Save background, shift, and exposure parameters
     params_df = pd.DataFrame([{
         'gfp_exposure_ms': gfp_exposure_ms,
         'mcherry_exposure_ms': mcherry_exposure_ms,
-        'gfp_bkg_mean': gfp_bkg_stats['mean'],
+        'gfp_bkg_median': gfp_bkg_stats['median'],
         'gfp_bkg_std': gfp_bkg_stats['std'],
-        'gfp_bkg_n_pixels': gfp_bkg_stats['n_pixels'],
-        'mcherry_bkg_mean': mcherry_bkg_stats['mean'],
+        'gfp_bkg_n_outliers': gfp_bkg_stats['n_outliers'],
+        'mcherry_bkg_median': mcherry_bkg_stats['median'],
         'mcherry_bkg_std': mcherry_bkg_stats['std'],
-        'mcherry_bkg_n_pixels': mcherry_bkg_stats['n_pixels'],
+        'mcherry_bkg_n_outliers': mcherry_bkg_stats['n_outliers'],
         'gfp_shift_x': gfp_shift_result['optimal_shift_x'],
         'gfp_shift_y': gfp_shift_result['optimal_shift_y'],
         'gfp_shift_pct_increase': gfp_shift_result['percent_increase'],
@@ -2185,9 +2394,9 @@ def process_cloning_image(input_file, output_dir, params=CELLPOSE_PARAMS, force_
     print(f"\nExposure times:")
     print(f"  GFP:     {gfp_exposure_ms} ms" if gfp_exposure_ms else "  GFP:     not found")
     print(f"  mCherry: {mcherry_exposure_ms} ms" if mcherry_exposure_ms else "  mCherry: not found")
-    print(f"\nBackground (pixel values):")
-    print(f"  GFP:     mean={gfp_bkg_stats['mean']:.1f}, std={gfp_bkg_stats['std']:.1f}")
-    print(f"  mCherry: mean={mcherry_bkg_stats['mean']:.1f}, std={mcherry_bkg_stats['std']:.1f}")
+    print(f"\nBackground (pixel values, center of 2D quadratic fit):")
+    print(f"  GFP:     center={gfp_bkg_stats['median']:.1f}, std={gfp_bkg_stats['std']:.1f}")
+    print(f"  mCherry: center={mcherry_bkg_stats['median']:.1f}, std={mcherry_bkg_stats['std']:.1f}")
     print(f"\nChannel shift (optimal):")
     print(f"  GFP:     dx={gfp_shift_result['optimal_shift_x']}, dy={gfp_shift_result['optimal_shift_y']} (+{gfp_shift_result['percent_increase']:.1f}%)")
     print(f"  mCherry: dx={mcherry_shift_result['optimal_shift_x']}, dy={mcherry_shift_result['optimal_shift_y']} (+{mcherry_shift_result['percent_increase']:.1f}%)")
@@ -2229,13 +2438,15 @@ if __name__ == '__main__':
                         help='For time series: which frame to process (0-indexed, default: 0)')
     parser.add_argument('--highpass-cutoff', type=float, default=12.0,
                         help='High-pass filter cutoff in pixels for focus detection (default: 12)')
-    parser.add_argument('--focus-method', type=str, default='highpass',
-                        choices=['highpass', 'brenner', 'variance'],
-                        help='Focus detection method: highpass (default), brenner, or variance')
-    parser.add_argument('--z-shift', type=int, default=None,
-                        help='Force constant z-shift between GFP and mCherry (GFP_z = mCherry_z + shift)')
+    parser.add_argument('--focus-method', type=str, default='fluorescence',
+                        choices=['fluorescence', 'highpass', 'brenner', 'variance'],
+                        help='Focus detection method: fluorescence (default, bkg-sub Brenner on mCherry), highpass, brenner, or variance')
+    parser.add_argument('--z-shift', type=int, default=2,
+                        help='Force constant z-shift between GFP and mCherry (GFP_z = mCherry_z + shift, default: 2)')
     parser.add_argument('--shift-range', type=int, default=5,
                         help='Range for XY channel alignment optimization in pixels (default: 5)')
+    parser.add_argument('--no-shift', action='store_true', default=False,
+                        help='Skip XY channel alignment optimization entirely')
     args = parser.parse_args()
 
     # Set output directory
@@ -2270,7 +2481,8 @@ if __name__ == '__main__':
         highpass_cutoff=args.highpass_cutoff,
         focus_method=args.focus_method,
         z_shift=args.z_shift,
-        shift_range=args.shift_range
+        shift_range=args.shift_range,
+        no_shift=args.no_shift,
     )
 
     print("\nDone!")

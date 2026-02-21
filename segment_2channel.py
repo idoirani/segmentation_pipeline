@@ -940,7 +940,8 @@ def process_2channel_image(input_file, output_dir, params=CELLPOSE_PARAMS, time_
                            gfp_channel=0, ph3_channel=1, max_area=MAX_CELL_AREA,
                            force_z=None, focus_metric='brenner', background_percentile=25,
                            shift_range=5, saturation_value=65535,
-                           autofocus_channel='gfp', segment_channel='ph3'):
+                           autofocus_channel='gfp', segment_channel='ph3',
+                           skip_gfp_refocus=False):
     """
     Process a 2-channel image (GFP + Ph3).
 
@@ -959,6 +960,7 @@ def process_2channel_image(input_file, output_dir, params=CELLPOSE_PARAMS, time_
         saturation_value: Pixel value for saturation detection (default: 65535)
         autofocus_channel: Which channel to autofocus on ('gfp' or 'ph3', default: 'gfp')
         segment_channel: Which channel to segment on ('ph3' or 'gfp', default: 'ph3')
+        skip_gfp_refocus: If True, use the same z-slice for GFP as autofocus (default: False)
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(exist_ok=True, parents=True)
@@ -1055,9 +1057,9 @@ def process_2channel_image(input_file, output_dir, params=CELLPOSE_PARAMS, time_
             print(f"  No shift needed (best at origin)")
 
     # GFP z-refocus: find the z-slice where max(GFP) within masks is highest
-    best_z_gfp = best_z  # default: same as Ph3
+    best_z_gfp = best_z  # default: same as autofocus
     z_max_gfp = None
-    if has_z and z_stack_data is not None and n_cells > 0:
+    if has_z and z_stack_data is not None and n_cells > 0 and not skip_gfp_refocus:
         print(f"\nGFP z-refocus: scanning z-slices for brightest GFP in masks...")
         best_z_gfp, z_max_gfp = select_best_z_gfp_in_masks(
             z_stack_data, gfp_masks, gfp_channel=gfp_channel)
@@ -1067,6 +1069,8 @@ def process_2channel_image(input_file, output_dir, params=CELLPOSE_PARAMS, time_
         # Use the GFP-optimal z-slice for GFP quantification
         gfp_image = z_stack_data[best_z_gfp, gfp_channel, :, :].copy()
         print(f"  Using GFP from z={best_z_gfp}, Ph3 from z={best_z}")
+    elif has_z and skip_gfp_refocus:
+        print(f"\nGFP z-refocus: skipped (using same z={best_z} as autofocus)")
 
     # Measure raw GFP intensities (using shifted masks for GFP)
     print("\nMeasuring GFP intensities...")
@@ -1355,6 +1359,8 @@ if __name__ == '__main__':
     parser.add_argument('--segment-channel', type=str, default='ph3',
                         choices=['gfp', 'ph3'],
                         help='Channel for segmentation (default: ph3)')
+    parser.add_argument('--skip-gfp-refocus', action='store_true',
+                        help='Skip GFP z-refocus; use same z as autofocus')
     args = parser.parse_args()
 
     # Set output directory
@@ -1401,6 +1407,7 @@ if __name__ == '__main__':
         saturation_value=args.saturation_value,
         autofocus_channel=args.autofocus_channel,
         segment_channel=args.segment_channel,
+        skip_gfp_refocus=args.skip_gfp_refocus,
     )
 
     print("\nDone!")
