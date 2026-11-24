@@ -33,10 +33,26 @@ from autofocus import select_best_z_fluorescence
 # Configuration
 # =============================================================================
 
-# Channel indices (from nd2 metadata: Ph3=0, GFP=1, mCherry=2)
-PH3_CHANNEL = 0
-GFP_CHANNEL = 1
+# Channel indices (defaults; overridden at runtime by detect_channel_indices)
+PH3_CHANNEL = 1
+GFP_CHANNEL = 0
 MCHERRY_CHANNEL = 2
+
+
+def detect_channel_indices(channel_names):
+    """
+    Detect GFP, Ph3, and mCherry channel indices from nd2 channel name list.
+
+    Returns (gfp_idx, ph3_idx, mcherry_idx). Any value may be None if the
+    corresponding channel is not found.
+    """
+    lo = [c.lower() for c in channel_names]
+    gfp_idx     = next((i for i, n in enumerate(lo) if 'gfp' in n), None)
+    mcherry_idx = next((i for i, n in enumerate(lo)
+                        if 'mcherry' in n or 'cherry' in n or 'mkate' in n or 'rfp' in n), None)
+    ph3_idx     = next((i for i, n in enumerate(lo)
+                        if 'ph3' in n or 'phase' in n or ('ph' in n and 'mcherry' not in n)), None)
+    return gfp_idx, ph3_idx, mcherry_idx
 
 # Omnipose parameters - using Ph3 (phase contrast) for segmentation
 CELLPOSE_PARAMS = {
@@ -1008,6 +1024,11 @@ def load_nd2_zstack(filepath, time_index=None):
             # Update sizes to remove T
             sizes = {k: v for k, v in sizes.items() if k != 'T'}
 
+        # Ensure data always has shape (Z, C, Y, X); add dummy Z=1 if no Z dimension
+        if 'Z' not in sizes:
+            data = data[np.newaxis, ...]   # (C, Y, X) → (1, C, Y, X)
+            sizes = {'Z': 1, **sizes}
+
         print(f"  Shape: {data.shape}")
         print(f"  Dimensions: Z={sizes['Z']}, C={sizes['C']}, Y={sizes['Y']}, X={sizes['X']}")
         print(f"  Channels: {channels}")
@@ -1462,8 +1483,14 @@ def save_segmentation_visualization(ph3_image, gfp_image, mcherry_image, masks,
         ax.set_title('Focus Selection Methods')
         ax.legend(fontsize=8)
         ax.set_ylim(-0.1, 1.1)
+    elif isinstance(focus_results, dict) and focus_results.get('method', '').startswith('none'):
+        # No z-stack: nothing to plot
+        ax.text(0.5, 0.5, 'Single z (no autofocus)', transform=ax.transAxes,
+                ha='center', va='center', fontsize=11, color='gray')
+        ax.set_title('Focus Selection')
+        ax.axis('off')
     else:
-        # Legacy single-method results
+        # Legacy single-method results (list of scores)
         z_scores = focus_results
         ax.bar(range(len(z_scores)), z_scores, color='steelblue')
         ax.axvline(best_z, color='red', linestyle='--', linewidth=2, label=f'Selected z={best_z}')
@@ -1510,7 +1537,8 @@ def save_segmentation_visualization(ph3_image, gfp_image, mcherry_image, masks,
     plt.close(fig)
 
 
-def save_z_crop_visualization(z_stack, masks, best_z, output_path, crop_size=100):
+def save_z_crop_visualization(z_stack, masks, best_z, output_path, crop_size=100,
+                              mcherry_channel=MCHERRY_CHANNEL):
     """Save visualization showing a cell crop across all z-slices."""
     n_z = z_stack.shape[0]
     img_h, img_w = z_stack.shape[2], z_stack.shape[3]
@@ -1562,12 +1590,12 @@ def save_z_crop_visualization(z_stack, masks, best_z, output_path, crop_size=100
     else:
         z_indices = range(n_z)
 
-    best_crop = z_stack[best_z, MCHERRY_CHANNEL, y_start:y_end, x_start:x_end]
+    best_crop = z_stack[best_z, mcherry_channel, y_start:y_end, x_start:x_end]
     vmin, vmax = np.percentile(best_crop, 1), np.percentile(best_crop, 99)
 
     for i, z in enumerate(z_indices):
         ax = axes[i]
-        crop = z_stack[z, MCHERRY_CHANNEL, y_start:y_end, x_start:x_end]
+        crop = z_stack[z, mcherry_channel, y_start:y_end, x_start:x_end]
         ax.imshow(crop, cmap='gray', vmin=vmin, vmax=vmax)
 
         if z == best_z:
@@ -2000,7 +2028,7 @@ Cell Area (pixels):
 # Main Processing
 # =============================================================================
 
-def process_cloning_image(input_file, output_dir, params=CELLPOSE_PARAMS, force_z=None, time_index=None, highpass_cutoff=12.0, focus_method='fluorescence', z_shift=2, shift_range=5, no_shift=False):
+def process_cloning_image(input_file, output_dir, params=CELLPOSE_PARAMS, force_z=None, time_index=None, highpass_cutoff=12.0, focus_method='fluorescence', z_shift=2, shift_range=5, no_shift=False, bkg_sub_segment=False):
     """
     Process a single z-stack cloning image.
 
@@ -2022,6 +2050,20 @@ def process_cloning_image(input_file, output_dir, params=CELLPOSE_PARAMS, force_
     data, sizes, channels = load_nd2_zstack(input_file, time_index=time_index)
     n_z = sizes['Z']
 
+    # Detect channel indices from metadata
+    gfp_ch, ph3_ch, mcherry_ch = detect_channel_indices(channels)
+    # Fall back to hardcoded defaults for any channel not found
+    if gfp_ch is None:
+        gfp_ch = GFP_CHANNEL
+        print(f"  WARNING: GFP channel not found by name, using default index {gfp_ch}")
+    if ph3_ch is None:
+        ph3_ch = PH3_CHANNEL
+        print(f"  WARNING: Ph3 channel not found by name, using default index {ph3_ch}")
+    if mcherry_ch is None:
+        mcherry_ch = MCHERRY_CHANNEL
+        print(f"  WARNING: mCherry channel not found by name, using default index {mcherry_ch}")
+    print(f"  Channel indices: GFP={gfp_ch}, Ph3={ph3_ch}, mCherry={mcherry_ch}")
+
     # Extract exposure times
     exposure_times = extract_exposure_times(input_file)
     gfp_exposure_ms = exposure_times.get('GFP', None)
@@ -2038,18 +2080,31 @@ def process_cloning_image(input_file, output_dir, params=CELLPOSE_PARAMS, force_
     # Convert cutoff to sigma (sigma = cutoff / 2.5)
     highpass_sigma = highpass_cutoff / 2.5
 
-    if force_z is not None:
+    if n_z == 1:
+        # No z-stack: skip autofocus, use the single slice
+        best_z = 0
+        best_z_gfp_measure = 0
+        focus_results = {
+            'method': 'none (single z)',
+            'mcherry': {'best_z': 0, 'scores': [1.0]},
+            'combined_z': 0,
+            'z_gfp_measure': 0,
+            'z_mcherry_measure': 0,
+            'z_segmentation': 0,
+        }
+        print(f"\nNo z-stack (Z=1): skipping autofocus, using z=0")
+    elif force_z is not None:
         best_z = force_z
         # Still compute focus metrics for visualization (use highpass for viz)
         _, focus_results = select_best_z_dual_highpass_gradient(
-            data, PH3_CHANNEL, MCHERRY_CHANNEL, highpass_sigma=highpass_sigma)
+            data, ph3_ch, mcherry_ch, highpass_sigma=highpass_sigma)
         focus_results['combined_z'] = force_z
         print(f"\nUsing forced z={best_z}")
     elif focus_method == 'brenner':
         # Use Brenner gradient - compute for all 3 channels
-        best_z_mcherry, mcherry_scores = select_best_z_brenner(data, MCHERRY_CHANNEL)
-        best_z_gfp, gfp_scores = select_best_z_brenner(data, GFP_CHANNEL)
-        best_z_ph3, ph3_scores = select_best_z_brenner(data, PH3_CHANNEL)
+        best_z_mcherry, mcherry_scores = select_best_z_brenner(data, mcherry_ch)
+        best_z_gfp, gfp_scores = select_best_z_brenner(data, gfp_ch)
+        best_z_ph3, ph3_scores = select_best_z_brenner(data, ph3_ch)
 
         # Use mCherry best z for segmentation
         best_z = best_z_mcherry
@@ -2068,8 +2123,8 @@ def process_cloning_image(input_file, output_dir, params=CELLPOSE_PARAMS, force_
         print(f"  Segmentation z: {best_z} (mCherry)")
     elif focus_method == 'variance':
         # Use normalized variance on mCherry channel only
-        best_z, mcherry_scores = select_best_z_normalized_variance(data, MCHERRY_CHANNEL)
-        _, ph3_scores = select_best_z_normalized_variance(data, PH3_CHANNEL)
+        best_z, mcherry_scores = select_best_z_normalized_variance(data, mcherry_ch)
+        _, ph3_scores = select_best_z_normalized_variance(data, ph3_ch)
         focus_results = {
             'ph3': {'best_z': np.argmax(ph3_scores), 'scores': ph3_scores},
             'mcherry': {'best_z': best_z, 'scores': mcherry_scores},
@@ -2081,7 +2136,7 @@ def process_cloning_image(input_file, output_dir, params=CELLPOSE_PARAMS, force_
         print(f"  Selected z:     {best_z}")
     elif focus_method == 'highpass':
         best_z, focus_results = select_best_z_dual_highpass_gradient(
-            data, PH3_CHANNEL, MCHERRY_CHANNEL, highpass_sigma=highpass_sigma)
+            data, ph3_ch, mcherry_ch, highpass_sigma=highpass_sigma)
         print(f"\nFocus selection (high-pass gradient, cutoff={highpass_cutoff}px):")
         print(f"  Ph3 best z:     {focus_results['ph3']['best_z']}")
         print(f"  mCherry best z: {focus_results['mcherry']['best_z']}")
@@ -2089,7 +2144,7 @@ def process_cloning_image(input_file, output_dir, params=CELLPOSE_PARAMS, force_
     else:
         # Default: background-subtracted Brenner on mCherry (same as segment_2channel.py)
         best_z, scores = select_best_z_fluorescence(
-            data, MCHERRY_CHANNEL,
+            data, mcherry_ch,
             background_percentile=25, metric='brenner')
         focus_results = {
             'method': 'fluorescence',
@@ -2100,22 +2155,19 @@ def process_cloning_image(input_file, output_dir, params=CELLPOSE_PARAMS, force_
         print(f"  Z-scores: {['%.1f' % s for s in scores]}")
         print(f"  mCherry best z: {best_z}")
 
-    # Determine z for each channel
-    # Segmentation uses mCherry best z (best_z)
-    # Measurements use each channel's best z (or z_shift if specified)
-    n_z = sizes['Z']
-
-    if z_shift is not None:
-        # Force constant shift: GFP_z = mCherry_z + shift
-        best_z_gfp_measure = max(0, min(n_z - 1, best_z + z_shift))
-        print(f"  Using forced z-shift: GFP at z={best_z_gfp_measure} (mCherry z + {z_shift})")
-    elif focus_method == 'brenner' and 'gfp' in focus_results:
-        # Use GFP's own best z for measurement
-        best_z_gfp_measure = focus_results['gfp']['best_z']
-        print(f"  GFP measurement at z={best_z_gfp_measure}, mCherry at z={best_z}")
-    else:
-        # Default: use same z for all
-        best_z_gfp_measure = best_z
+    # Determine z for each channel (only relevant when n_z > 1)
+    if n_z > 1:
+        if z_shift is not None:
+            # Force constant shift: GFP_z = mCherry_z + shift
+            best_z_gfp_measure = max(0, min(n_z - 1, best_z + z_shift))
+            print(f"  Using forced z-shift: GFP at z={best_z_gfp_measure} (mCherry z + {z_shift})")
+        elif focus_method == 'brenner' and 'gfp' in focus_results:
+            # Use GFP's own best z for measurement
+            best_z_gfp_measure = focus_results['gfp']['best_z']
+            print(f"  GFP measurement at z={best_z_gfp_measure}, mCherry at z={best_z}")
+        else:
+            # Default: use same z for all
+            best_z_gfp_measure = best_z
 
     # Store z positions in focus_results
     focus_results['z_gfp_measure'] = best_z_gfp_measure
@@ -2123,9 +2175,9 @@ def process_cloning_image(input_file, output_dir, params=CELLPOSE_PARAMS, force_
     focus_results['z_segmentation'] = best_z
 
     # Get images: mCherry at segmentation z, GFP and Ph3 at shifted z
-    mcherry_image = data[best_z, MCHERRY_CHANNEL, :, :]
-    gfp_image = data[best_z_gfp_measure, GFP_CHANNEL, :, :]
-    ph3_image = data[best_z_gfp_measure, PH3_CHANNEL, :, :]
+    mcherry_image = data[best_z, mcherry_ch, :, :]
+    gfp_image = data[best_z_gfp_measure, gfp_ch, :, :]
+    ph3_image = data[best_z_gfp_measure, ph3_ch, :, :]
 
     # Initialize model and segment
     print(f"\nInitializing Omnipose model...")
@@ -2144,17 +2196,28 @@ def process_cloning_image(input_file, output_dir, params=CELLPOSE_PARAMS, force_
         segment_image = ph3_image
         print(f"  Segmenting on Ph3 channel...")
 
-    masks = segment_frame(model, segment_image, params)
+    if bkg_sub_segment:
+        empty_masks = np.zeros(segment_image.shape, dtype=np.int32)
+        seg_bkg = calculate_background(segment_image, empty_masks)['bkg_image']
+        seg_input = np.clip(segment_image.astype(np.float32) - seg_bkg, 0, None)
+        seg_min, seg_max = seg_input.min(), seg_input.max()
+        seg_input = (seg_input - seg_min) / (seg_max - seg_min)
+        print(f"  Background-subtracted + min-max normalized for segmentation")
+    else:
+        seg_input = segment_image
+
+    masks = segment_frame(model, seg_input, params)
     n_cells = len(np.unique(masks)) - 1  # Exclude background
     print(f"  Detected {n_cells} cells")
 
     # mCherry intensity refocus: scan all z-slices for brightest mCherry within masks
-    if n_cells > 0:
+    # (only when there is a z-stack to scan)
+    if n_cells > 0 and n_z > 1:
         print(f"\nmCherry intensity refocus: scanning z-slices for brightest mCherry in masks...")
         mask_bool = masks > 0
         z_max_mcherry = []
         for z in range(n_z):
-            ch_slice = data[z, MCHERRY_CHANNEL, :, :]
+            ch_slice = data[z, mcherry_ch, :, :]
             z_max_mcherry.append(float(ch_slice[mask_bool].max()) if np.any(mask_bool) else 0.0)
         best_z_refocus = int(np.argmax(z_max_mcherry))
         z_jump = abs(best_z_refocus - best_z)
@@ -2165,7 +2228,7 @@ def process_cloning_image(input_file, output_dir, params=CELLPOSE_PARAMS, force_
         # re-segment at the new z to get a better mask
         if z_jump >= 2 and n_cells < 6:
             print(f"  Large z-jump ({z_jump}) with few cells ({n_cells}) — re-segmenting at z={best_z_refocus}...")
-            reseg_image = data[best_z_refocus, MCHERRY_CHANNEL, :, :]
+            reseg_image = data[best_z_refocus, mcherry_ch, :, :]
             masks = segment_frame(model, reseg_image, params)
             n_cells = len(np.unique(masks)) - 1
             print(f"  Re-segmentation detected {n_cells} cells")
@@ -2182,9 +2245,9 @@ def process_cloning_image(input_file, output_dir, params=CELLPOSE_PARAMS, force_
         focus_results['z_segmentation'] = best_z
 
         # Re-extract images at updated z positions
-        mcherry_image = data[best_z, MCHERRY_CHANNEL, :, :]
-        gfp_image = data[best_z_gfp_measure, GFP_CHANNEL, :, :]
-        ph3_image = data[best_z_gfp_measure, PH3_CHANNEL, :, :]
+        mcherry_image = data[best_z, mcherry_ch, :, :]
+        gfp_image = data[best_z_gfp_measure, gfp_ch, :, :]
+        ph3_image = data[best_z_gfp_measure, ph3_ch, :, :]
 
     # Calculate background for each fluorescent channel (2D quadratic model)
     print("\nCalculating background...")
@@ -2341,11 +2404,8 @@ def process_cloning_image(input_file, output_dir, params=CELLPOSE_PARAMS, force_
             'selected': [z == best_z for z in range(len(gradient_scores))]
         })
     else:
-        z_df = pd.DataFrame({
-            'z': range(len(focus_results)),
-            'focus_score': focus_results,
-            'selected': [z == best_z for z in range(len(focus_results))]
-        })
+        # Single-z or unknown method: just record which z was used
+        z_df = pd.DataFrame({'z': [best_z], 'selected': [True]})
     z_path = output_dir / 'z_selection.csv'
     z_df.to_csv(z_path, index=False)
     print(f"  Z-selection: {z_path}")
@@ -2362,7 +2422,8 @@ def process_cloning_image(input_file, output_dir, params=CELLPOSE_PARAMS, force_
 
     save_z_crop_visualization(
         data, masks, best_z,
-        output_dir / 'z_crop.png'
+        output_dir / 'z_crop.png',
+        mcherry_channel=mcherry_ch
     )
     print(f"  Z-crop: z_crop.png")
 
@@ -2375,7 +2436,7 @@ def process_cloning_image(input_file, output_dir, params=CELLPOSE_PARAMS, force_
 
     # Best-focus composite (GFP and mCherry each at their optimal z)
     save_best_focus_composite(data, focus_results, output_dir / 'best_focus_composite.png',
-                              gfp_channel=GFP_CHANNEL, mcherry_channel=MCHERRY_CHANNEL)
+                              gfp_channel=gfp_ch, mcherry_channel=mcherry_ch)
     print(f"  Best-focus composite: best_focus_composite.png")
 
     # Masks colored by mCherry/GFP ratio
@@ -2485,6 +2546,8 @@ if __name__ == '__main__':
                         help='Range for XY channel alignment optimization in pixels (default: 5)')
     parser.add_argument('--no-shift', action='store_true', default=False,
                         help='Skip XY channel alignment optimization entirely')
+    parser.add_argument('--bkg-sub-segment', action='store_true', default=False,
+                        help='Subtract 2D quadratic background and min-max normalize before segmentation')
     args = parser.parse_args()
 
     # Set output directory
@@ -2521,6 +2584,7 @@ if __name__ == '__main__':
         z_shift=args.z_shift,
         shift_range=args.shift_range,
         no_shift=args.no_shift,
+        bkg_sub_segment=args.bkg_sub_segment,
     )
 
     print("\nDone!")
