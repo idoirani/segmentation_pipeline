@@ -8,6 +8,7 @@ cloning_wt/
 CellASIC_*/
 CellAsic_*/
 Tshift_*/
+with_mkate/
 
 # Python
 __pycache__/
