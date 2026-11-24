@@ -47,7 +47,7 @@ def detect_channel_indices(channel_names):
     corresponding channel is not found.
     """
     lo = [c.lower() for c in channel_names]
-    gfp_idx     = next((i for i, n in enumerate(lo) if 'gfp' in n), None)
+    gfp_idx     = next((i for i, n in enumerate(lo) if 'gfp' in n or 'yfp' in n), None)
     mcherry_idx = next((i for i, n in enumerate(lo)
                         if 'mcherry' in n or 'cherry' in n or 'mkate' in n or 'rfp' in n), None)
     ph3_idx     = next((i for i, n in enumerate(lo)
@@ -552,7 +552,7 @@ def extract_exposure_times(nd2_file):
     return exposure_times
 
 
-def extract_nd2_metadata(nd2_file, time_index=None):
+def extract_nd2_metadata(nd2_file, time_index=None, position_index=None):
     """
     Extract all metadata from an nd2 file into a flat dictionary.
 
@@ -677,6 +677,10 @@ def extract_nd2_metadata(nd2_file, time_index=None):
 
         # Per-frame metadata (frame 0, or time_index)
         frame_idx = time_index if time_index is not None else 0
+        if position_index is not None and 'P' in f.sizes:
+            # Frames are ordered (T, P, Z): first frame of this position
+            frame_idx = (frame_idx * f.sizes['P'] + position_index) * f.sizes.get('Z', 1)
+            meta['position_index'] = position_index
         try:
             fm = f.frame_metadata(frame_idx)
             ch0 = fm.channels[0]
@@ -996,7 +1000,7 @@ def apply_mask_shift(masks, dx, dy):
 # Core Functions
 # =============================================================================
 
-def load_nd2_zstack(filepath, time_index=None):
+def load_nd2_zstack(filepath, time_index=None, position_index=None):
     """Load nd2 z-stack file and return data array and metadata.
 
     Args:
@@ -1023,6 +1027,16 @@ def load_nd2_zstack(filepath, time_index=None):
             data = data[time_index]  # Extract single timepoint
             # Update sizes to remove T
             sizes = {k: v for k, v in sizes.items() if k != 'T'}
+
+        # Handle multi-position (XY) files
+        if 'P' in sizes:
+            n_positions = sizes['P']
+            if position_index is None:
+                position_index = 0
+            print(f"  Multi-position file detected: {n_positions} positions")
+            print(f"  Extracting position P={position_index}")
+            data = data[position_index]
+            sizes = {k: v for k, v in sizes.items() if k != 'P'}
 
         # Ensure data always has shape (Z, C, Y, X); add dummy Z=1 if no Z dimension
         if 'Z' not in sizes:
@@ -2028,7 +2042,7 @@ Cell Area (pixels):
 # Main Processing
 # =============================================================================
 
-def process_cloning_image(input_file, output_dir, params=CELLPOSE_PARAMS, force_z=None, time_index=None, highpass_cutoff=12.0, focus_method='fluorescence', z_shift=2, shift_range=5, no_shift=False, bkg_sub_segment=False):
+def process_cloning_image(input_file, output_dir, params=CELLPOSE_PARAMS, force_z=None, time_index=None, highpass_cutoff=12.0, focus_method='fluorescence', z_shift=2, shift_range=5, no_shift=False, bkg_sub_segment=False, position_index=None):
     """
     Process a single z-stack cloning image.
 
@@ -2047,7 +2061,7 @@ def process_cloning_image(input_file, output_dir, params=CELLPOSE_PARAMS, force_
     output_dir.mkdir(exist_ok=True, parents=True)
 
     # Load data
-    data, sizes, channels = load_nd2_zstack(input_file, time_index=time_index)
+    data, sizes, channels = load_nd2_zstack(input_file, time_index=time_index, position_index=position_index)
     n_z = sizes['Z']
 
     # Detect channel indices from metadata
@@ -2073,7 +2087,7 @@ def process_cloning_image(input_file, output_dir, params=CELLPOSE_PARAMS, force_
     print(f"  mCherry: {mcherry_exposure_ms} ms" if mcherry_exposure_ms else "  mCherry: not found")
 
     # Extract and save nd2 metadata
-    nd2_metadata = extract_nd2_metadata(input_file, time_index=time_index)
+    nd2_metadata = extract_nd2_metadata(input_file, time_index=time_index, position_index=position_index)
     save_nd2_metadata(nd2_metadata, output_dir / 'nd2_metadata.csv')
 
     # Select best z-slice
@@ -2526,15 +2540,17 @@ if __name__ == '__main__':
                         help='Output directory (default: based on input filename)')
     parser.add_argument('--force-z', type=int, default=None,
                         help='Force specific z-slice (default: automatic selection)')
-    parser.add_argument('--model', type=str, default='cyto3',
-                        help='Cellpose model type (default: cyto3)')
+    parser.add_argument('--model', type=str, default='bact_fluor_omni',
+                        help='Omnipose model type (default: bact_fluor_omni)')
     parser.add_argument('--diameter', type=int, default=15,
                         help='Cell diameter for segmentation (default: 15)')
-    parser.add_argument('--segment-channel', type=str, default='ph3',
+    parser.add_argument('--segment-channel', type=str, default='mcherry',
                         choices=['ph3', 'mcherry', 'gfp'],
-                        help='Channel to segment on (default: ph3)')
+                        help='Channel to segment on (default: mcherry)')
     parser.add_argument('--time-index', type=int, default=None,
                         help='For time series: which frame to process (0-indexed, default: 0)')
+    parser.add_argument('--position', type=int, default=None,
+                        help='For multi-position files: which XY position to process (0-indexed, default: 0)')
     parser.add_argument('--highpass-cutoff', type=float, default=12.0,
                         help='High-pass filter cutoff in pixels for focus detection (default: 12)')
     parser.add_argument('--focus-method', type=str, default='fluorescence',
@@ -2585,6 +2601,7 @@ if __name__ == '__main__':
         shift_range=args.shift_range,
         no_shift=args.no_shift,
         bkg_sub_segment=args.bkg_sub_segment,
+        position_index=args.position,
     )
 
     print("\nDone!")
