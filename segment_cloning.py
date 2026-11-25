@@ -33,6 +33,11 @@ from autofocus import select_best_z_fluorescence
 # Configuration
 # =============================================================================
 
+# Display label for the measured (green/yellow) channel, used in plots and printouts.
+# Set at runtime from --measure-label, or from the nd2 channel name (e.g. 'YFP').
+# CSV columns keep the 'gfp_*' prefix for compatibility with collect_results*.py.
+MEASURE_LABEL = 'GFP'
+
 # Channel indices (defaults; overridden at runtime by detect_channel_indices)
 PH3_CHANNEL = 1
 GFP_CHANNEL = 0
@@ -53,6 +58,30 @@ def detect_channel_indices(channel_names):
     ph3_idx     = next((i for i, n in enumerate(lo)
                         if 'ph3' in n or 'phase' in n or ('ph' in n and 'mcherry' not in n)), None)
     return gfp_idx, ph3_idx, mcherry_idx
+
+
+def resolve_channel(spec, channel_names):
+    """
+    Resolve a user channel spec to an index.
+
+    spec may be an integer index (e.g. 1 or '1') or a case-insensitive
+    substring of a channel name (e.g. 'yfp', 'GFP', 'mKate').
+    """
+    if spec is None:
+        return None
+    spec = str(spec).strip()
+    if spec.lstrip('-').isdigit():
+        idx = int(spec)
+        if not 0 <= idx < len(channel_names):
+            raise ValueError(f"Channel index {idx} out of range for channels {channel_names}")
+        return idx
+    lo = [c.lower() for c in channel_names]
+    exact = [i for i, n in enumerate(lo) if n == spec.lower()]
+    matches = exact or [i for i, n in enumerate(lo) if spec.lower() in n]
+    if len(matches) != 1:
+        raise ValueError(f"Channel '{spec}' matched {len(matches)} channels in {channel_names}; "
+                         f"use an exact name or an index")
+    return matches[0]
 
 # Omnipose parameters - using Ph3 (phase contrast) for segmentation
 CELLPOSE_PARAMS = {
@@ -1294,12 +1323,12 @@ def save_background_visualization(gfp_image, mcherry_image, gfp_bkg_stats, mcher
     fig, axes = plt.subplots(2, 3, figsize=(15, 10))
 
     for row, (raw, bkg, sub, name, center) in enumerate([
-        (gfp_image, gfp_bkg_image, gfp_bkg_sub, 'GFP', gfp_bkg_stats['median']),
+        (gfp_image, gfp_bkg_image, gfp_bkg_sub, MEASURE_LABEL, gfp_bkg_stats['median']),
         (mcherry_image, mcherry_bkg_image, mcherry_bkg_sub, 'mCherry', mcherry_bkg_stats['median']),
     ]):
         vmin_raw = np.percentile(raw, 1)
         vmax_raw = np.percentile(raw, 99)
-        cmap = 'Greens' if name == 'GFP' else 'Reds'
+        cmap = 'Greens' if name == MEASURE_LABEL else 'Reds'
 
         axes[row, 0].imshow(raw, cmap=cmap, vmin=vmin_raw, vmax=vmax_raw)
         axes[row, 0].set_title(f'{name} raw')
@@ -1357,7 +1386,7 @@ def save_segmentation_visualization(ph3_image, gfp_image, mcherry_image, masks,
     # GFP
     axes[0, 1].imshow(gfp_image, cmap='Greens',
                       vmin=gfp_vmin, vmax=gfp_vmax)
-    axes[0, 1].set_title('GFP')
+    axes[0, 1].set_title(MEASURE_LABEL)
     axes[0, 1].axis('off')
 
     # mCherry
@@ -1382,13 +1411,13 @@ def save_segmentation_visualization(ph3_image, gfp_image, mcherry_image, masks,
         mcherry_norm = np.array(mcherry_scores) / max(mcherry_scores) if max(mcherry_scores) > 0 else mcherry_scores
 
         ax.plot(z_indices, ph3_norm, 'b-o', label=f'Ph3 (z={focus_results["ph3"]["best_z"]})', markersize=4)
-        ax.plot(z_indices, gfp_norm, 'g-s', label=f'GFP (z={focus_results["gfp"]["best_z"]})', markersize=4)
+        ax.plot(z_indices, gfp_norm, 'g-s', label=f'{MEASURE_LABEL} (z={focus_results["gfp"]["best_z"]})', markersize=4)
         ax.plot(z_indices, mcherry_norm, 'r-^', label=f'mCherry (z={focus_results["mcherry"]["best_z"]})', markersize=4)
 
         # Mark segmentation z and GFP measurement z
         ax.axvline(best_z, color='red', linestyle='--', linewidth=2, alpha=0.7, label=f'Seg z={best_z}')
         if 'z_gfp_measure' in focus_results and focus_results['z_gfp_measure'] != best_z:
-            ax.axvline(focus_results['z_gfp_measure'], color='green', linestyle=':', linewidth=2, alpha=0.7, label=f'GFP z={focus_results["z_gfp_measure"]}')
+            ax.axvline(focus_results['z_gfp_measure'], color='green', linestyle=':', linewidth=2, alpha=0.7, label=f'{MEASURE_LABEL} z={focus_results["z_gfp_measure"]}')
 
         ax.set_xlabel('Z-slice')
         ax.set_ylabel('Normalized Brenner Score')
@@ -1454,7 +1483,7 @@ def save_segmentation_visualization(ph3_image, gfp_image, mcherry_image, masks,
         gfp_grad_norm = np.array(gfp_grad_scores) / max(gfp_grad_scores) if max(gfp_grad_scores) > 0 else gfp_grad_scores
         mcherry_grad_norm = np.array(mcherry_grad_scores) / max(mcherry_grad_scores) if max(mcherry_grad_scores) > 0 else mcherry_grad_scores
 
-        ax.plot(z_indices, gfp_grad_norm, 'g-o', label=f'GFP grad (z={focus_results["gfp"]["gradient"]["best_z"]})', markersize=3, alpha=0.7)
+        ax.plot(z_indices, gfp_grad_norm, 'g-o', label=f'{MEASURE_LABEL} grad (z={focus_results["gfp"]["gradient"]["best_z"]})', markersize=3, alpha=0.7)
         ax.plot(z_indices, mcherry_grad_norm, 'r-o', label=f'mCherry grad (z={focus_results["mcherry"]["gradient"]["best_z"]})', markersize=3, alpha=0.7)
 
         # Mark cell_size best z for each channel
@@ -1527,7 +1556,7 @@ def save_segmentation_visualization(ph3_image, gfp_image, mcherry_image, masks,
                       vmin=gfp_vmin, vmax=gfp_vmax)
     for outline in outlines:
         axes[1, 1].plot(outline[:, 0], outline[:, 1], 'lime', linewidth=0.5)
-    axes[1, 1].set_title('GFP + Segmentation')
+    axes[1, 1].set_title(f'{MEASURE_LABEL} + Segmentation')
     axes[1, 1].axis('off')
 
     # Cell masks
@@ -1543,7 +1572,7 @@ def save_segmentation_visualization(ph3_image, gfp_image, mcherry_image, masks,
     composite[:, :, 0] = np.clip(mcherry_norm, 0, 1)  # Red
     composite[:, :, 1] = np.clip(gfp_norm, 0, 1)      # Green
     axes[1, 3].imshow(composite)
-    axes[1, 3].set_title('Composite (GFP=green, mCherry=red)')
+    axes[1, 3].set_title(f'Composite ({MEASURE_LABEL}=green, mCherry=red)')
     axes[1, 3].axis('off')
 
     plt.tight_layout()
@@ -1640,9 +1669,9 @@ def save_intensity_histograms(cell_df, output_path):
     # GFP sum histogram
     axes[0, 0].hist(cell_df['gfp_sum'], bins=50, color='green', alpha=0.7, edgecolor='darkgreen')
     axes[0, 0].axvline(cell_df['gfp_sum'].mean(), color='black', linestyle='--', label=f'Mean: {cell_df["gfp_sum"].mean():.0f}')
-    axes[0, 0].set_xlabel('GFP Sum Intensity')
+    axes[0, 0].set_xlabel(f'{MEASURE_LABEL} Sum Intensity')
     axes[0, 0].set_ylabel('Count')
-    axes[0, 0].set_title('GFP Total Intensity per Cell')
+    axes[0, 0].set_title(f'{MEASURE_LABEL} Total Intensity per Cell')
     axes[0, 0].legend()
 
     # mCherry sum histogram
@@ -1657,18 +1686,18 @@ def save_intensity_histograms(cell_df, output_path):
     valid_ratios = cell_df['gfp_mcherry_ratio'].dropna()
     axes[0, 2].hist(valid_ratios, bins=50, color='purple', alpha=0.7, edgecolor='darkviolet')
     axes[0, 2].axvline(valid_ratios.mean(), color='black', linestyle='--', label=f'Mean: {valid_ratios.mean():.2f}')
-    axes[0, 2].set_xlabel('GFP/mCherry Ratio')
+    axes[0, 2].set_xlabel(f'{MEASURE_LABEL}/mCherry Ratio')
     axes[0, 2].set_ylabel('Count')
-    axes[0, 2].set_title('GFP/mCherry Ratio per Cell')
+    axes[0, 2].set_title(f'{MEASURE_LABEL}/mCherry Ratio per Cell')
     axes[0, 2].legend()
 
     # Row 2: Mean intensities and scatter
     # GFP mean histogram
     axes[1, 0].hist(cell_df['gfp_mean'], bins=50, color='green', alpha=0.7, edgecolor='darkgreen')
     axes[1, 0].axvline(cell_df['gfp_mean'].mean(), color='black', linestyle='--', label=f'Mean: {cell_df["gfp_mean"].mean():.1f}')
-    axes[1, 0].set_xlabel('GFP Mean Intensity')
+    axes[1, 0].set_xlabel(f'{MEASURE_LABEL} Mean Intensity')
     axes[1, 0].set_ylabel('Count')
-    axes[1, 0].set_title('GFP Mean Intensity per Cell')
+    axes[1, 0].set_title(f'{MEASURE_LABEL} Mean Intensity per Cell')
     axes[1, 0].legend()
 
     # mCherry mean histogram
@@ -1682,8 +1711,8 @@ def save_intensity_histograms(cell_df, output_path):
     # Scatter: GFP vs mCherry
     axes[1, 2].scatter(cell_df['mcherry_mean'], cell_df['gfp_mean'], alpha=0.5, s=20, c='blue')
     axes[1, 2].set_xlabel('mCherry Mean Intensity')
-    axes[1, 2].set_ylabel('GFP Mean Intensity')
-    axes[1, 2].set_title('GFP vs mCherry (per cell)')
+    axes[1, 2].set_ylabel(f'{MEASURE_LABEL} Mean Intensity')
+    axes[1, 2].set_title(f'{MEASURE_LABEL} vs mCherry (per cell)')
 
     plt.tight_layout()
     plt.savefig(output_path, dpi=VIS_DPI)
@@ -1735,14 +1764,14 @@ def save_ratio_mask_visualization(masks, cell_df, output_path, ratio_column='gfp
 
     # Add colorbar
     cbar = plt.colorbar(im, ax=ax, shrink=0.8)
-    cbar.set_label('mCherry / GFP rate ratio', fontsize=12)
+    cbar.set_label(f'mCherry / {MEASURE_LABEL} rate ratio', fontsize=12)
 
     # Calculate stats
     ratios = ratio_map[masks > 0]
     mean_ratio = np.mean(ratios)
     median_ratio = np.median(ratios)
 
-    ax.set_title(f'Cells colored by mCherry/GFP rate ratio\n'
+    ax.set_title(f'Cells colored by mCherry/{MEASURE_LABEL} rate ratio\n'
                  f'Mean: {mean_ratio:.3f}, Median: {median_ratio:.3f}, n={len(cell_df)}',
                  fontsize=14)
     ax.axis('off')
@@ -1791,14 +1820,14 @@ def save_best_focus_composite(data, focus_results, output_path, gfp_channel=1, m
     fig, ax = plt.subplots(figsize=(12, 12))
 
     ax.imshow(composite)
-    ax.set_title(f'Best Focus Composite\nGFP (green) z={z_gfp}, mCherry (red) z={z_mcherry}',
+    ax.set_title(f'Best Focus Composite\n{MEASURE_LABEL} (green) z={z_gfp}, mCherry (red) z={z_mcherry}',
                 fontsize=14)
     ax.axis('off')
 
     # Add colorbar legend
     from matplotlib.patches import Patch
     legend_elements = [
-        Patch(facecolor='green', label=f'GFP (z={z_gfp})'),
+        Patch(facecolor='green', label=f'{MEASURE_LABEL} (z={z_gfp})'),
         Patch(facecolor='red', label=f'mCherry (z={z_mcherry})'),
         Patch(facecolor='yellow', label='Colocalization'),
     ]
@@ -1846,7 +1875,7 @@ def save_saturation_visualization(gfp_image, mcherry_image, masks, output_path, 
     n_gfp_sat_cells = len(np.unique(masks[gfp_saturated_mask])) if n_gfp_sat_pixels > 0 else 0
 
     axes[0].imshow(gfp_rgb)
-    axes[0].set_title(f'GFP Saturation\n{n_gfp_sat_pixels} saturated pixels in {n_gfp_sat_cells} cells', fontsize=12)
+    axes[0].set_title(f'{MEASURE_LABEL} Saturation\n{n_gfp_sat_pixels} saturated pixels in {n_gfp_sat_cells} cells', fontsize=12)
     axes[0].axis('off')
 
     # mCherry saturation visualization
@@ -1920,7 +1949,7 @@ def save_channel_shift_visualization(gfp_image, mcherry_image, masks, shift_resu
     composite_orig = composite_base.copy()
     composite_orig[boundaries_original, :] = [1, 1, 1]  # White outlines
     axes[0].imshow(composite_orig)
-    axes[0].set_title('Original (shift = 0, 0)\nGFP=green, mCherry=red', fontsize=12)
+    axes[0].set_title(f'Original (shift = 0, 0)\n{MEASURE_LABEL}=green, mCherry=red', fontsize=12)
     axes[0].axis('off')
 
     # Optimal shift
@@ -1977,19 +2006,19 @@ def save_ratio_analysis(cell_df, output_path, gfp_exposure_ms=None, mcherry_expo
     median_ratio = valid_df['gfp_mcherry_ratio'].median()
     axes[0, 0].axvline(mean_ratio, color='black', linestyle='--', linewidth=2, label=f'Mean: {mean_ratio:.3f}')
     axes[0, 0].axvline(median_ratio, color='gray', linestyle=':', linewidth=2, label=f'Median: {median_ratio:.3f}')
-    axes[0, 0].set_xlabel('GFP/mCherry Rate Ratio')
+    axes[0, 0].set_xlabel(f'{MEASURE_LABEL}/mCherry Rate Ratio')
     axes[0, 0].set_ylabel('Count')
     exp_info = ""
     if gfp_exposure_ms and mcherry_exposure_ms:
-        exp_info = f"\n(GFP: {gfp_exposure_ms}ms, mCherry: {mcherry_exposure_ms}ms)"
-    axes[0, 0].set_title(f'GFP/mCherry Rate Ratio Distribution{exp_info}\n(n={len(valid_df)}, std={std_ratio:.3f})')
+        exp_info = f"\n({MEASURE_LABEL}: {gfp_exposure_ms}ms, mCherry: {mcherry_exposure_ms}ms)"
+    axes[0, 0].set_title(f'{MEASURE_LABEL}/mCherry Rate Ratio Distribution{exp_info}\n(n={len(valid_df)}, std={std_ratio:.3f})')
     axes[0, 0].legend()
 
     # Log-scale ratio histogram
     log_ratios = np.log10(valid_df['gfp_mcherry_ratio'][valid_df['gfp_mcherry_ratio'] > 0])
     axes[0, 1].hist(log_ratios, bins=50, color='orange', alpha=0.7, edgecolor='darkorange')
     axes[0, 1].axvline(log_ratios.mean(), color='black', linestyle='--', label=f'Mean: {log_ratios.mean():.2f}')
-    axes[0, 1].set_xlabel('log10(GFP/mCherry Rate Ratio)')
+    axes[0, 1].set_xlabel(f'log10({MEASURE_LABEL}/mCherry Rate Ratio)')
     axes[0, 1].set_ylabel('Count')
     axes[0, 1].set_title('Log-scale Rate Ratio Distribution')
     axes[0, 1].legend()
@@ -1997,7 +2026,7 @@ def save_ratio_analysis(cell_df, output_path, gfp_exposure_ms=None, mcherry_expo
     # Ratio vs cell area
     axes[1, 0].scatter(valid_df['area_pixels'], valid_df['gfp_mcherry_ratio'], alpha=0.5, s=20, c='purple')
     axes[1, 0].set_xlabel('Cell Area (pixels)')
-    axes[1, 0].set_ylabel('GFP/mCherry Rate Ratio')
+    axes[1, 0].set_ylabel(f'{MEASURE_LABEL}/mCherry Rate Ratio')
     axes[1, 0].set_title('Rate Ratio vs Cell Size')
 
     # Summary stats text
@@ -2042,7 +2071,7 @@ Cell Area (pixels):
 # Main Processing
 # =============================================================================
 
-def process_cloning_image(input_file, output_dir, params=CELLPOSE_PARAMS, force_z=None, time_index=None, highpass_cutoff=12.0, focus_method='fluorescence', z_shift=2, shift_range=5, no_shift=False, bkg_sub_segment=False, position_index=None):
+def process_cloning_image(input_file, output_dir, params=CELLPOSE_PARAMS, force_z=None, time_index=None, highpass_cutoff=12.0, focus_method='fluorescence', z_shift=2, shift_range=5, no_shift=False, bkg_sub_segment=False, position_index=None, measure_channel=None, measure_label=None):
     """
     Process a single z-stack cloning image.
 
@@ -2057,6 +2086,7 @@ def process_cloning_image(input_file, output_dir, params=CELLPOSE_PARAMS, force_
         z_shift: Force constant z-shift between channels
         shift_range: Range for XY channel alignment optimization (default: 5)
     """
+    global MEASURE_LABEL
     output_dir = Path(output_dir)
     output_dir.mkdir(exist_ok=True, parents=True)
 
@@ -2066,24 +2096,32 @@ def process_cloning_image(input_file, output_dir, params=CELLPOSE_PARAMS, force_
 
     # Detect channel indices from metadata
     gfp_ch, ph3_ch, mcherry_ch = detect_channel_indices(channels)
+    # User-specified measurement channel overrides auto-detection
+    if measure_channel is not None:
+        gfp_ch = resolve_channel(measure_channel, channels)
+        print(f"  Measurement channel set by user: '{measure_channel}' -> index {gfp_ch} ({channels[gfp_ch]})")
     # Fall back to hardcoded defaults for any channel not found
     if gfp_ch is None:
         gfp_ch = GFP_CHANNEL
-        print(f"  WARNING: GFP channel not found by name, using default index {gfp_ch}")
+        print(f"  WARNING: {MEASURE_LABEL} channel not found by name, using default index {gfp_ch}")
     if ph3_ch is None:
         ph3_ch = PH3_CHANNEL
         print(f"  WARNING: Ph3 channel not found by name, using default index {ph3_ch}")
     if mcherry_ch is None:
         mcherry_ch = MCHERRY_CHANNEL
         print(f"  WARNING: mCherry channel not found by name, using default index {mcherry_ch}")
-    print(f"  Channel indices: GFP={gfp_ch}, Ph3={ph3_ch}, mCherry={mcherry_ch}")
+    # Display label: user-specified, else the channel's name in the nd2 file
+    MEASURE_LABEL = measure_label or channels[gfp_ch]
+    print(f"  Measurement label: {MEASURE_LABEL}")
+    print(f"  Channel indices: {MEASURE_LABEL}={gfp_ch}, Ph3={ph3_ch}, mCherry={mcherry_ch}")
 
     # Extract exposure times
     exposure_times = extract_exposure_times(input_file)
-    gfp_exposure_ms = exposure_times.get('GFP', None)
-    mcherry_exposure_ms = exposure_times.get('mCherry', None)
+    # Look up by the detected channel names (e.g. 'YFP' for GFP, 'mKate' for mCherry)
+    gfp_exposure_ms = exposure_times.get(channels[gfp_ch], exposure_times.get('GFP', None))
+    mcherry_exposure_ms = exposure_times.get(channels[mcherry_ch], exposure_times.get('mCherry', None))
     print(f"\nExposure times:")
-    print(f"  GFP: {gfp_exposure_ms} ms" if gfp_exposure_ms else "  GFP: not found")
+    print(f"  {MEASURE_LABEL}: {gfp_exposure_ms} ms" if gfp_exposure_ms else f"  {MEASURE_LABEL}: not found")
     print(f"  mCherry: {mcherry_exposure_ms} ms" if mcherry_exposure_ms else "  mCherry: not found")
 
     # Extract and save nd2 metadata
@@ -2132,7 +2170,7 @@ def process_cloning_image(input_file, output_dir, params=CELLPOSE_PARAMS, force_
         }
         print(f"\nFocus selection (Brenner gradient):")
         print(f"  Ph3 best z:     {best_z_ph3}")
-        print(f"  GFP best z:     {best_z_gfp}")
+        print(f"  {MEASURE_LABEL} best z:     {best_z_gfp}")
         print(f"  mCherry best z: {best_z_mcherry}")
         print(f"  Segmentation z: {best_z} (mCherry)")
     elif focus_method == 'variance':
@@ -2174,11 +2212,11 @@ def process_cloning_image(input_file, output_dir, params=CELLPOSE_PARAMS, force_
         if z_shift is not None:
             # Force constant shift: GFP_z = mCherry_z + shift
             best_z_gfp_measure = max(0, min(n_z - 1, best_z + z_shift))
-            print(f"  Using forced z-shift: GFP at z={best_z_gfp_measure} (mCherry z + {z_shift})")
+            print(f"  Using forced z-shift: {MEASURE_LABEL} at z={best_z_gfp_measure} (mCherry z + {z_shift})")
         elif focus_method == 'brenner' and 'gfp' in focus_results:
             # Use GFP's own best z for measurement
             best_z_gfp_measure = focus_results['gfp']['best_z']
-            print(f"  GFP measurement at z={best_z_gfp_measure}, mCherry at z={best_z}")
+            print(f"  {MEASURE_LABEL} measurement at z={best_z_gfp_measure}, mCherry at z={best_z}")
         else:
             # Default: use same z for all
             best_z_gfp_measure = best_z
@@ -2205,7 +2243,7 @@ def process_cloning_image(input_file, output_dir, params=CELLPOSE_PARAMS, force_
         print(f"  Segmenting on mCherry channel...")
     elif segment_channel == 'gfp':
         segment_image = gfp_image
-        print(f"  Segmenting on GFP channel...")
+        print(f"  Segmenting on {MEASURE_LABEL} channel...")
     else:
         segment_image = ph3_image
         print(f"  Segmenting on Ph3 channel...")
@@ -2254,7 +2292,7 @@ def process_cloning_image(input_file, output_dir, params=CELLPOSE_PARAMS, force_
         # Recompute GFP z from updated mCherry z
         if z_shift is not None:
             best_z_gfp_measure = max(0, min(n_z - 1, best_z + z_shift))
-            print(f"  GFP z updated: {best_z_gfp_measure} (mCherry z + {z_shift})")
+            print(f"  {MEASURE_LABEL} z updated: {best_z_gfp_measure} (mCherry z + {z_shift})")
         focus_results['z_gfp_measure'] = best_z_gfp_measure
         focus_results['z_segmentation'] = best_z
 
@@ -2267,7 +2305,7 @@ def process_cloning_image(input_file, output_dir, params=CELLPOSE_PARAMS, force_
     print("\nCalculating background...")
     gfp_bkg_stats = calculate_background(gfp_image, masks, iqr_factor=1.5)
     mcherry_bkg_stats = calculate_background(mcherry_image, masks, iqr_factor=1.5)
-    print(f"  GFP background: center={gfp_bkg_stats['median']:.1f}, std={gfp_bkg_stats['std']:.1f}")
+    print(f"  {MEASURE_LABEL} background: center={gfp_bkg_stats['median']:.1f}, std={gfp_bkg_stats['std']:.1f}")
     print(f"  mCherry background: center={mcherry_bkg_stats['median']:.1f}, std={mcherry_bkg_stats['std']:.1f}")
 
     # Find optimal channel shift
@@ -2284,7 +2322,7 @@ def process_cloning_image(input_file, output_dir, params=CELLPOSE_PARAMS, force_
         gfp_shift_result = find_optimal_channel_shift(masks, gfp_image, shift_range=shift_range)
         mcherry_shift_result = find_optimal_channel_shift(masks, mcherry_image, shift_range=shift_range)
 
-        print(f"  GFP optimal shift: dx={gfp_shift_result['optimal_shift_x']}, "
+        print(f"  {MEASURE_LABEL} optimal shift: dx={gfp_shift_result['optimal_shift_x']}, "
               f"dy={gfp_shift_result['optimal_shift_y']} (+{gfp_shift_result['percent_increase']:.1f}%)")
         print(f"  mCherry optimal shift: dx={mcherry_shift_result['optimal_shift_x']}, "
               f"dy={mcherry_shift_result['optimal_shift_y']} (+{mcherry_shift_result['percent_increase']:.1f}%)")
@@ -2300,7 +2338,7 @@ def process_cloning_image(input_file, output_dir, params=CELLPOSE_PARAMS, force_
         # Segmented on mCherry, only optimize shift for GFP
         gfp_shift_result = find_optimal_channel_shift(masks, gfp_image, shift_range=shift_range)
 
-        print(f"  GFP optimal shift: dx={gfp_shift_result['optimal_shift_x']}, "
+        print(f"  {MEASURE_LABEL} optimal shift: dx={gfp_shift_result['optimal_shift_x']}, "
               f"dy={gfp_shift_result['optimal_shift_y']} (+{gfp_shift_result['percent_increase']:.1f}%)")
         print(f"  mCherry: no shift (segmentation channel)")
 
@@ -2313,7 +2351,7 @@ def process_cloning_image(input_file, output_dir, params=CELLPOSE_PARAMS, force_
         # Segmented on GFP, only optimize shift for mCherry
         mcherry_shift_result = find_optimal_channel_shift(masks, mcherry_image, shift_range=shift_range)
 
-        print(f"  GFP: no shift (segmentation channel)")
+        print(f"  {MEASURE_LABEL}: no shift (segmentation channel)")
         print(f"  mCherry optimal shift: dx={mcherry_shift_result['optimal_shift_x']}, "
               f"dy={mcherry_shift_result['optimal_shift_y']} (+{mcherry_shift_result['percent_increase']:.1f}%)")
 
@@ -2344,7 +2382,7 @@ def process_cloning_image(input_file, output_dir, params=CELLPOSE_PARAMS, force_
         n_mcherry_sat = cell_df['mcherry_saturated'].sum()
         if n_gfp_sat > 0 or n_mcherry_sat > 0:
             print(f"  WARNING: Saturated cells detected!")
-            print(f"    GFP saturated: {n_gfp_sat}/{len(cell_df)} cells")
+            print(f"    {MEASURE_LABEL} saturated: {n_gfp_sat}/{len(cell_df)} cells")
             print(f"    mCherry saturated: {n_mcherry_sat}/{len(cell_df)} cells")
 
     # Compute summary
@@ -2461,7 +2499,7 @@ def process_cloning_image(input_file, output_dir, params=CELLPOSE_PARAMS, force_
     if segment_channel != 'gfp' and len(gfp_shift_result['all_shifts']) > 0:
         save_channel_shift_visualization(gfp_image, mcherry_image, masks, gfp_shift_result,
                                           output_dir / 'channel_shift_gfp.png')
-        print(f"  Channel shift (GFP): channel_shift_gfp.png")
+        print(f"  Channel shift ({MEASURE_LABEL}): channel_shift_gfp.png")
 
     if segment_channel != 'mcherry' and len(mcherry_shift_result['all_shifts']) > 0:
         save_channel_shift_visualization(gfp_image, mcherry_image, masks, mcherry_shift_result,
@@ -2480,6 +2518,8 @@ def process_cloning_image(input_file, output_dir, params=CELLPOSE_PARAMS, force_
 
     # Save background, shift, and exposure parameters
     params_df = pd.DataFrame([{
+        'measure_channel': channels[gfp_ch],
+        'measure_label': MEASURE_LABEL,
         'gfp_exposure_ms': gfp_exposure_ms,
         'mcherry_exposure_ms': mcherry_exposure_ms,
         'gfp_bkg_median': gfp_bkg_stats['median'],
@@ -2505,21 +2545,21 @@ def process_cloning_image(input_file, output_dir, params=CELLPOSE_PARAMS, force_
     print(f"Number of cells: {n_cells}")
     print(f"Best z-slice: {best_z}")
     print(f"\nExposure times:")
-    print(f"  GFP:     {gfp_exposure_ms} ms" if gfp_exposure_ms else "  GFP:     not found")
+    print(f"  {MEASURE_LABEL}:     {gfp_exposure_ms} ms" if gfp_exposure_ms else f"  {MEASURE_LABEL}:     not found")
     print(f"  mCherry: {mcherry_exposure_ms} ms" if mcherry_exposure_ms else "  mCherry: not found")
     print(f"\nBackground (pixel values, center of 2D quadratic fit):")
-    print(f"  GFP:     center={gfp_bkg_stats['median']:.1f}, std={gfp_bkg_stats['std']:.1f}")
+    print(f"  {MEASURE_LABEL}:     center={gfp_bkg_stats['median']:.1f}, std={gfp_bkg_stats['std']:.1f}")
     print(f"  mCherry: center={mcherry_bkg_stats['median']:.1f}, std={mcherry_bkg_stats['std']:.1f}")
     print(f"\nChannel shift (optimal):")
-    print(f"  GFP:     dx={gfp_shift_result['optimal_shift_x']}, dy={gfp_shift_result['optimal_shift_y']} (+{gfp_shift_result['percent_increase']:.1f}%)")
+    print(f"  {MEASURE_LABEL}:     dx={gfp_shift_result['optimal_shift_x']}, dy={gfp_shift_result['optimal_shift_y']} (+{gfp_shift_result['percent_increase']:.1f}%)")
     print(f"  mCherry: dx={mcherry_shift_result['optimal_shift_x']}, dy={mcherry_shift_result['optimal_shift_y']} (+{mcherry_shift_result['percent_increase']:.1f}%)")
-    print(f"\nGFP rate (bkg-sub intensity / exposure):")
+    print(f"\n{MEASURE_LABEL} rate (bkg-sub intensity / exposure):")
     print(f"  Mean: {summary.get('gfp_rate_mean', 0):.1f}")
     print(f"  Std:  {summary.get('gfp_rate_std', 0):.1f}")
     print(f"\nmCherry rate (bkg-sub intensity / exposure):")
     print(f"  Mean: {summary.get('mcherry_rate_mean', 0):.1f}")
     print(f"  Std:  {summary.get('mcherry_rate_std', 0):.1f}")
-    print(f"\nGFP/mCherry Rate Ratio:")
+    print(f"\n{MEASURE_LABEL}/mCherry Rate Ratio:")
     print(f"  Mean:   {summary['ratio_mean']:.4f}")
     print(f"  Std:    {summary['ratio_std']:.4f}")
     print(f"  Median: {summary['ratio_median']:.4f}")
@@ -2546,18 +2586,24 @@ if __name__ == '__main__':
                         help='Cell diameter for segmentation (default: 15)')
     parser.add_argument('--segment-channel', type=str, default='mcherry',
                         choices=['ph3', 'mcherry', 'gfp'],
-                        help='Channel to segment on (default: mcherry)')
+                        help="Channel to segment on (default: mcherry). 'gfp' = the measurement channel (see --measure-channel)")
     parser.add_argument('--time-index', type=int, default=None,
                         help='For time series: which frame to process (0-indexed, default: 0)')
     parser.add_argument('--position', type=int, default=None,
                         help='For multi-position files: which XY position to process (0-indexed, default: 0)')
+    parser.add_argument('--measure-channel', type=str, default=None,
+                        help='Channel to quantify against mCherry: name (e.g. YFP, GFP; case-insensitive) '
+                             'or index. Default: auto-detect a channel named GFP or YFP')
+    parser.add_argument('--measure-label', type=str, default=None,
+                        help='Label for the measured channel in plots and printouts '
+                             '(default: its name in the nd2 file). CSV columns keep the gfp_* prefix')
     parser.add_argument('--highpass-cutoff', type=float, default=12.0,
                         help='High-pass filter cutoff in pixels for focus detection (default: 12)')
     parser.add_argument('--focus-method', type=str, default='fluorescence',
                         choices=['fluorescence', 'highpass', 'brenner', 'variance'],
                         help='Focus detection method: fluorescence (default, bkg-sub Brenner on mCherry), highpass, brenner, or variance')
     parser.add_argument('--z-shift', type=int, default=2,
-                        help='Force constant z-shift between GFP and mCherry (GFP_z = mCherry_z + shift, default: 2)')
+                        help='Force constant z-shift between the measurement channel and mCherry (measure_z = mCherry_z + shift, default: 2)')
     parser.add_argument('--shift-range', type=int, default=5,
                         help='Range for XY channel alignment optimization in pixels (default: 5)')
     parser.add_argument('--no-shift', action='store_true', default=False,
@@ -2602,6 +2648,8 @@ if __name__ == '__main__':
         no_shift=args.no_shift,
         bkg_sub_segment=args.bkg_sub_segment,
         position_index=args.position,
+        measure_channel=args.measure_channel,
+        measure_label=args.measure_label,
     )
 
     print("\nDone!")

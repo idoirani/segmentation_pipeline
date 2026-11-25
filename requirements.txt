@@ -1,0 +1,24 @@
+# Segmentation pipeline dependencies (pip).
+# Versions are those of the tested environment (conda env "cellpose", Python 3.10.18, macOS arm64).
+# Newer versions will likely work but are untested; omnipose in particular is version-sensitive.
+#
+#   conda create -n cellpose python=3.10
+#   conda activate cellpose
+#   pip install -r requirements.txt
+
+# Segmentation (provides the `cellpose_omni` and `omnipose` modules)
+omnipose==1.0.6
+torch==2.2.2
+torchvision==0.17.2
+
+# Image I/O
+nd2==0.11.1
+tifffile==2025.5.10
+opencv-python-headless==4.12.0.88
+
+# Numerics / analysis / plotting
+numpy==1.26.4
+scipy==1.15.3
+pandas==2.3.3
+matplotlib==3.10.8
+scikit-image==0.25.2
